@@ -43,7 +43,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "string.h"
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 /* USER CODE END Includes */
@@ -55,7 +55,19 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define DACResolution 12
+#define TurnOn 3000
+#define OutMax 4096
+#define Averages 5
+#define SetpointStep 10
+#define MaximumSD 50
+#define CalibrationDelay 10000
+#define MaxCommands 10
+#define Threshold 8
+#define SampleTimeInSec 0.1
+#define AUTOMATIC 1
+#define MANUAL 0
+#define UpdateStall 30
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -68,13 +80,13 @@ ADC_HandleTypeDef hadc1;
 
 DAC_HandleTypeDef hdac1;
 
-FDCAN_HandleTypeDef hfdcan1;
-
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim8;
+TIM_HandleTypeDef htim13;
 
 UART_HandleTypeDef huart3;
 
@@ -83,26 +95,41 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 /* USER CODE BEGIN PV */
 
 int len, PWM;
+char  Rx_index, Rx_data[2], Rx_Buffer[100], Transfer_cplt, buffer[100], bufferEcho[100];
+char strt = '!', del = '!', Start, Timer, Channel, Brightness[4]="300", Rx_String[100];
 
-char  Rx_index, Rx_data[2], Rx_Buffer[100], Transfer_cplt, buffer[100];
-
-char Start, Timer, Channel, Brightness[4]="300", Rx_String[100];
+unsigned char j;
 uint8_t Device, State;
 
 /* Buffer used for transmission */
+
+unsigned Setpoint = TurnOn;
+unsigned MaxSetpoint = 4086;
+float PreviousVoltages[Averages];
+float MeanVoltage;
+float AverageVoltage;
+unsigned Calibrating = 0;
+
+char *Command[MaxCommands];
+unsigned WordIndex;
 
 unsigned ADC_raw[3];
 float ADC_float[3];
 float LOAD_CURRENT;
 float LOAD_VOLTAGE;
 float TEMPERATURE;
-float mVoltsPerBit = 0.05035;	//(3300/65535)
-float mAmpsPerBit = 0.05035;	//(3300/65535)
-float DegsPerBit = 0.005035;	//(3.3/65535)/0.01
+
+float mVoltsPerBit = 0.00005035;	//(3.300/65535)
+float mAmpsPerBit = 0.00005035;	//(3.300/65535)
+float DegsPerBit = ((0.107421875/256));	//(3.3/65535)/0.01
 float ScaleFactor = 1;
-float offset = 0;
+float offset = -1024;
 unsigned Vout = 128;
-uint8_t i = 0;
+
+uint8_t inAuto = 0;
+int Input, lastInput, Output, kp = 10, kd = 1; updateCount = 0;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,12 +139,13 @@ static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_DAC1_Init(void);
-static void MX_FDCAN1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_TIM8_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM13_Init(void);
 /* USER CODE BEGIN PFP */
 static void StringSort(void);
 static void CalculateValues(void);
@@ -127,33 +155,44 @@ static void SendValues(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 void CalculateValues(void){
-	LOAD_VOLTAGE = (((ADC_float[0]*mVoltsPerBit)*ScaleFactor)+offset);
-	LOAD_CURRENT = (((ADC_float[1]*mAmpsPerBit)*ScaleFactor)+offset);
-	TEMPERATURE = (((ADC_float[2]*DegsPerBit)*ScaleFactor)+offset);
-	SendValues();
+	LOAD_VOLTAGE = (((ADC_float[2]*ScaleFactor)+offset)*mVoltsPerBit);
+	if (Calibrating == 1){return;}
+	LOAD_CURRENT = (((ADC_float[0]*ScaleFactor)+offset)*mAmpsPerBit);
+	TEMPERATURE = (((ADC_float[1]*ScaleFactor)+offset)*DegsPerBit);
+	updatePID();
+	updateCount++;
+	if(updateCount==UpdateStall){
+		updateCount==0;
+		SendValues();
+	}
 }
 
 void SendValues(void){
 
-	len=sprintf(buffer, "!Voltage\n");
+	len=sprintf(buffer, "!Voltage!%.3f!\n", (LOAD_VOLTAGE));
 	HAL_UART_Transmit(&huart3, buffer, len, 1000);
 
-	len=sprintf(buffer, "!Current\n");
+	len=sprintf(buffer, "!Current!%.3f!\n", LOAD_CURRENT);
 	HAL_UART_Transmit(&huart3, buffer, len, 1000);
 
-//	LOAD_VOLTAGE
-//	LOAD_CURRENT
-//	TEMPERATURE
-
+	len=sprintf(buffer, "!Temperature!%.3f!\n", TEMPERATURE);
+	HAL_UART_Transmit(&huart3, buffer, len, 1000);
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef*hadc){
-	if (__HAL_ADC_GET_FLAG(hadc, ADC_FLAG_EOC))
+	uint8_t i;
+	 if (__HAL_ADC_GET_FLAG(hadc, ADC_FLAG_EOC))
+	  {
+	  ADC_raw[i] = HAL_ADC_GetValue(hadc);
+	  ADC_float[i] = (float)ADC_raw[i];
+	  i++;
+
+	  }
+	if (__HAL_ADC_GET_FLAG(hadc, ADC_FLAG_EOS))
 		{
 			ADC_raw[i] = HAL_ADC_GetValue(hadc);
 			ADC_float[i] = (float)ADC_raw[i];
-			i++;
-			if (i>2) i=0;
+			i=0;
 			CalculateValues();
 		}
 }
@@ -162,13 +201,124 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance==TIM8) //check if the interrupt comes from TIM8
         {
-    	len=sprintf(buffer, "!Protection 1 Alive\n");
-    	HAL_UART_Transmit(&huart3, buffer, len, 1000);
+			len=sprintf(buffer, "!Protection 1 Alive!!\n");
+			HAL_UART_Transmit(&huart3, buffer, len, 1000);
+        }
+    if (htim->Instance==TIM1) {
+    	if (Calibrating == 1){return;}
+        	HAL_ADC_Start_IT(&hadc1);
         }
 }
 
+void Calibrate(void){
+	Calibrating=1;											// Enable the Calibrating flag to disable normal voltage/current/temperature measurements
+	float VoltageSum = 0;
+	float SD = 5;
+	float Difference;
+	float Varsum;
+	float Variance;
+	float MeanVoltages[100];
+	unsigned k=0;
+	unsigned m=0;
 
+recalibrate:
+	for (Setpoint=TurnOn; Setpoint < MaxSetpoint; Setpoint = Setpoint + SetpointStep){
 
+		while (SD > MaximumSD) {
+			VoltageSum = 0;
+			Difference = 0;
+			Variance = 0;
+			Varsum = 0;
+			k=0;
+
+			while (k<Averages){
+				HAL_ADC_Start_IT(&hadc1);					// Take ADC readings
+				PreviousVoltages[k]=LOAD_VOLTAGE;
+				HAL_Delay(CalibrationDelay);
+				k++;
+				VoltageSum = VoltageSum + LOAD_VOLTAGE;		// Add the current LOAD_VOLTAGE to the running sum
+				MeanVoltage = (VoltageSum/k);				// and take the mean
+				Difference = LOAD_VOLTAGE - MeanVoltage;	// The difference is the current LOAD_VOLTAGE less the running MeanVoltage
+				Varsum = Varsum + pow(Difference,2);		// and Varsum is the running sum of the squares of the Difference
+			}
+		  Variance = Varsum / (float)k;
+		  SD = sqrt(Variance);
+		}
+		MeanVoltages[m]=MeanVoltage;
+		m++;
+	}
+
+	for (m=0; m<100; m++) {
+		VoltageSum = 0;
+		Difference = 0;
+		Variance = 0;
+		Varsum = 0;
+		k=0;
+
+		while (k<5){
+			k++;
+			MeanVoltages[(m+k)];
+			VoltageSum = VoltageSum + LOAD_VOLTAGE;
+			MeanVoltage = (VoltageSum/k);
+			Difference = LOAD_VOLTAGE - MeanVoltage;
+			Varsum = Varsum + pow(Difference,2);
+		}
+	  Variance = Varsum / (float)k;
+	  SD = sqrt(Variance);
+	  if (SD<Threshold ){
+		  Setpoint=(TurnOn+(m*SetpointStep));				// Set the new Setpoint
+		  Calibrating=0;									// Disable the Calibrating flag to resume normal voltage/current/temperature measurements
+		  return;											// break and return from the loop
+	  }
+	}
+	/*
+	 * If this is reached calibration failed
+	 */
+	len=sprintf(buffer, "!CalibrationFailed!1!");			// Report the failure
+	HAL_UART_Transmit(&huart3, buffer, len, 1000);
+	goto recalibrate;										// and attempt to recalibrate
+	SetMode(AUTOMATIC);
+}
+
+void updatePID(void){
+	   if(!inAuto) return;
+
+	  /*Compute all the working error variables*/
+	  Input = ((ADC_float[2]*ScaleFactor)+offset);			// Take the corrected ADC value for voltage and store as input
+	  double error = Setpoint - Input;						// Find the error value
+	  double dInput = (Input - lastInput);					// Input difference
+
+	  /*Compute PID Output*/
+	  Output = kp * error - kd * dInput;					// Find the new output
+	  if(Output > OutMax) Output = OutMax;					// Stop wind-up
+	  else if(Output < TurnOn) Output = TurnOn;				// Stop wind-down
+	  HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_8B_R, Output);
+}
+
+void SetTunings(double Kp, double Kd)
+{
+   if (Kp<0 || Kd<0) return;
+   kp = Kp;
+   kd = Kd / SampleTimeInSec;
+}
+
+void InitialisePID(){
+	lastInput=Input;
+}
+
+void SetMode(int Mode)
+{
+    uint8_t newAuto = (Mode == AUTOMATIC);
+    if(newAuto == !inAuto)
+    {  /*we just went from manual to auto*/
+        Initialize();
+    }
+    inAuto = newAuto;
+}
+
+void UpdateSetpoint(void){
+	HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_8B_R, Setpoint);
+}
 
 /* USER CODE END 0 */
 
@@ -205,20 +355,21 @@ int main(void)
   MX_USB_OTG_FS_PCD_Init();
   MX_ADC1_Init();
   MX_DAC1_Init();
-  MX_FDCAN1_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_TIM2_Init();
   MX_TIM5_Init();
   MX_TIM8_Init();
+  MX_TIM1_Init();
+  MX_TIM13_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_IT(&hadc1);
   HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_8B_R, Vout);
   HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
+  HAL_TIM_Base_Start_IT(&htim1);
   HAL_TIM_Base_Start_IT(&htim8);
 
   HAL_UART_Receive_IT(&huart3, Rx_data, 1);	// Activate USART rx interrupt
-
 
 //  HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_1);
 //  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2);
@@ -236,6 +387,9 @@ int main(void)
 //  RidePWM();
 
 
+  Calibrate();
+
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -247,8 +401,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  HAL_ADC_Start_IT(&hadc1);
-	  HAL_Delay(200);
+
 	  if (Transfer_cplt==1) {
 		  StringSort();
 		  Transfer_cplt=0;
@@ -279,13 +432,12 @@ void SystemClock_Config(void)
   {
     
   }
-  /**Macro to configure the PLL clock source 
-  */
-  __HAL_RCC_PLL_PLLSOURCE_CONFIG(RCC_PLLSOURCE_HSE);
   /**Initializes the CPU, AHB and APB busses clocks 
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 1;
@@ -317,20 +469,12 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USART3|RCC_PERIPHCLK_FDCAN
-                              |RCC_PERIPHCLK_ADC|RCC_PERIPHCLK_USB;
-  PeriphClkInitStruct.PLL2.PLL2M = 4;
-  PeriphClkInitStruct.PLL2.PLL2N = 129;
-  PeriphClkInitStruct.PLL2.PLL2P = 2;
-  PeriphClkInitStruct.PLL2.PLL2Q = 2;
-  PeriphClkInitStruct.PLL2.PLL2R = 2;
-  PeriphClkInitStruct.PLL2.PLL2RGE = RCC_PLL2VCIRANGE_1;
-  PeriphClkInitStruct.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;
-  PeriphClkInitStruct.PLL2.PLL2FRACN = 0;
-  PeriphClkInitStruct.FdcanClockSelection = RCC_FDCANCLKSOURCE_PLL;
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USART3|RCC_PERIPHCLK_ADC
+                              |RCC_PERIPHCLK_USB|RCC_PERIPHCLK_CKPER;
+  PeriphClkInitStruct.CkperClockSelection = RCC_CLKPSOURCE_HSI;
   PeriphClkInitStruct.Usart234578ClockSelection = RCC_USART234578CLKSOURCE_D2PCLK1;
   PeriphClkInitStruct.UsbClockSelection = RCC_USBCLKSOURCE_PLL;
-  PeriphClkInitStruct.AdcClockSelection = RCC_ADCCLKSOURCE_PLL2;
+  PeriphClkInitStruct.AdcClockSelection = RCC_ADCCLKSOURCE_CLKP;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -360,11 +504,11 @@ static void MX_ADC1_Init(void)
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
   hadc1.Init.Resolution = ADC_RESOLUTION_16B;
-  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.NbrOfConversion = 3;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
@@ -386,12 +530,29 @@ static void MX_ADC1_Init(void)
   }
   /**Configure Regular Channel 
   */
-  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Channel = ADC_CHANNEL_2;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_16CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /**Configure Regular Channel 
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /**Configure Regular Channel 
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -444,65 +605,81 @@ static void MX_DAC1_Init(void)
 }
 
 /**
-  * @brief FDCAN1 Initialization Function
+  * @brief TIM1 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_FDCAN1_Init(void)
+static void MX_TIM1_Init(void)
 {
 
-  /* USER CODE BEGIN FDCAN1_Init 0 */
+  /* USER CODE BEGIN TIM1_Init 0 */
 
-  /* USER CODE END FDCAN1_Init 0 */
+  /* USER CODE END TIM1_Init 0 */
 
-  /* USER CODE BEGIN FDCAN1_Init 1 */
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
-  /* USER CODE END FDCAN1_Init 1 */
-  hfdcan1.Instance = FDCAN1;
-  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
-  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = DISABLE;
-  hfdcan1.Init.TransmitPause = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 1;
-  hfdcan1.Init.NominalSyncJumpWidth = 1;
-  hfdcan1.Init.NominalTimeSeg1 = 2;
-  hfdcan1.Init.NominalTimeSeg2 = 2;
-  hfdcan1.Init.DataPrescaler = 1;
-  hfdcan1.Init.DataSyncJumpWidth = 1;
-  hfdcan1.Init.DataTimeSeg1 = 1;
-  hfdcan1.Init.DataTimeSeg2 = 1;
-  hfdcan1.Init.MessageRAMOffset = 0;
-  hfdcan1.Init.StdFiltersNbr = 0;
-  hfdcan1.Init.ExtFiltersNbr = 0;
-  hfdcan1.Init.RxFifo0ElmtsNbr = 0;
-  hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_8;
-  hfdcan1.Init.RxFifo1ElmtsNbr = 0;
-  hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_8;
-  hfdcan1.Init.RxBuffersNbr = 0;
-  hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_8;
-  hfdcan1.Init.TxEventsNbr = 0;
-  hfdcan1.Init.TxBuffersNbr = 0;
-  hfdcan1.Init.TxFifoQueueElmtsNbr = 0;
-  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
-  hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_8;
-  hfdcan1.msgRam.StandardFilterSA = 0;
-  hfdcan1.msgRam.ExtendedFilterSA = 0;
-  hfdcan1.msgRam.RxFIFO0SA = 0;
-  hfdcan1.msgRam.RxFIFO1SA = 0;
-  hfdcan1.msgRam.RxBufferSA = 0;
-  hfdcan1.msgRam.TxEventFIFOSA = 0;
-  hfdcan1.msgRam.TxBufferSA = 0;
-  hfdcan1.msgRam.TxFIFOQSA = 0;
-  hfdcan1.msgRam.TTMemorySA = 0;
-  hfdcan1.msgRam.EndAddress = 0;
-  hfdcan1.ErrorCode = 0;
-  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 48000;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 19960;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN FDCAN1_Init 2 */
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
 
-  /* USER CODE END FDCAN1_Init 2 */
+  /* USER CODE END TIM1_Init 2 */
 
 }
 
@@ -743,6 +920,10 @@ static void MX_TIM5_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM5_Init 2 */
 
   /* USER CODE END TIM5_Init 2 */
@@ -826,6 +1007,51 @@ static void MX_TIM8_Init(void)
   /* USER CODE BEGIN TIM8_Init 2 */
 
   /* USER CODE END TIM8_Init 2 */
+
+}
+
+/**
+  * @brief TIM13 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM13_Init(void)
+{
+
+  /* USER CODE BEGIN TIM13_Init 0 */
+
+  /* USER CODE END TIM13_Init 0 */
+
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM13_Init 1 */
+
+  /* USER CODE END TIM13_Init 1 */
+  htim13.Instance = TIM13;
+  htim13.Init.Prescaler = 480;
+  htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim13.Init.Period = 333;
+  htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim13.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim13) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OC_Init(&htim13) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_OC_ConfigChannel(&htim13, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM13_Init 2 */
+
+  /* USER CODE END TIM13_Init 2 */
 
 }
 
@@ -916,16 +1142,16 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_1|GPIO_PIN_12|GPIO_PIN_14, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_12|GPIO_PIN_14, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
@@ -948,8 +1174,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PF1 PF12 PF14 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_12|GPIO_PIN_14;
+  /*Configure GPIO pins : PF12 PF14 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_14;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -1026,34 +1252,55 @@ static void MX_GPIO_Init(void)
 //	__HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_3,PWM);
 //}
 
+void *StringSlice(void){
+
+	    int m = 0;
+	    char *p = strtok (Rx_Buffer, "!");
+
+	    while (p != "\r")
+	    {
+	        Command[m++] = p;
+	        printf("%s\n", p);
+	    	p = strtok (NULL, "!");
+	    }
+
+	return 0;
+}
+
+
+
 void StringSort(void)
 {
-	Start=Rx_String[0];
-	if (Start=='!') {								// Test for opcode proceed on ! or clear the Rx_String
-		/*
-		 * Split the string into components
-		 */
-		Device=(uint8_t)(Rx_String[1]);				// Determine the device type
-		Timer = Rx_String[2];					// Load the timer address
-		Channel=Rx_String[3];						// Set the channel address
-		State = (uint8_t)(Rx_String[4]);			// Boolean identifier for State
+	/*
+	 * Split the string into components
+	 */
 
-		Brightness[0] = (Rx_String[5]);
-		Brightness[1] = (Rx_String[6]);
-		Brightness[2] = (Rx_String[7]);
-		//strcat(Brightness,Rx_String[6]);
-		//strcat(Brightness,Rx_String[7]);
-		PWM = atoi(Brightness);
-		/*
-		 * Perform the operation
-		 */
+	StringSlice();
+	Device=(uint8_t)(Command[1]);				// Determine the device type
+	Timer = Command[2];							// Load the timer address
+	Channel=Command[3];							// Set the channel address
+	State = (uint8_t)(Command[4]);				// Boolean identifier for State
 
-		//  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
-		switch(Device)
-		{
-		case '1':									// Case 1 is a light
+	char strLen = strlen(Rx_Buffer);			// Find the string length of the Rx_Buffer
+	switch (strLen) {
+		case 5 :		Brightness[0] = '0';
+						Brightness[1] = '0';
+						strcpy(Brightness, Command[5]);
 
-			switch (Timer) {
+		case 6 :		Brightness[0] = '0';
+						strcpy(Brightness, Command[5]);
+
+		case 7 :		strcpy(Brightness, Command[5]);
+	}
+	PWM = atoi(Brightness);
+	/*
+	 * Perform the operation
+	 */
+	switch(Device)
+	{
+	case '1':									// Case 1 is a light
+
+		switch (Timer) {
 //			case '1':
 //				switch (Channel) {
 //				case '1': __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1,PWM);
@@ -1065,117 +1312,124 @@ void StringSort(void)
 //				case '4': __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_4,PWM);
 //				switch (State) {case '0': HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_4); case '1': HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);}
 //					}
-			case '2':
-				switch (Channel) {
-					case '1': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_1,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1); break;
-							case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-						}break;
-					case '2': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_2,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2); break;
-							case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-						} break;
-					case '3': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_3,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_3); break;
-							case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-						}break;
-					case '4': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_4,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_4); break;
-							case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
-						} break;
-				} break;
+		case '2':
+			switch (Channel) {
+				case '1': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_1,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1); break;
+						case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+					}break;
+				case '2': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_2,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2); break;
+						case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+					} break;
+				case '3': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_3,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_3); break;
+						case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+					}break;
+				case '4': __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_4,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_4); break;
+						case '1': HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
+					} break;
+			} break;
 
-			case '3':
-				switch (Channel) {
-					case '1': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_1,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1); break;
-							case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-						} break;
-					case '2': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2); break;
-							case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-						} break;
-					case '3': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_3,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_3); break;
-							case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
-						} break;
-					case '4': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_4,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_4); break;
-							case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
-						} break;
-				} break;
+		case '3':
+			switch (Channel) {
+				case '1': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_1,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1); break;
+						case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+					} break;
+				case '2': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2); break;
+						case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+					} break;
+				case '3': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_3,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_3); break;
+						case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+					} break;
+				case '4': __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_4,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_4); break;
+						case '1': HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+					} break;
+			} break;
 
-			case '4':
-				switch (Channel) {
-					case '1': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_1); break;
-							case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-						} break;
-					case '2': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_2,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_2); break;
-							case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
-						} break;
-					case '3': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_3,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_3); break;
-							case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
-						} break;
-					case '4': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_4,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4); break;
-							case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
-						} break;
-				} break;
+		case '4':
+			switch (Channel) {
+				case '1': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_1); break;
+						case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+					} break;
+				case '2': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_2,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_2); break;
+						case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
+					} break;
+				case '3': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_3,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_3); break;
+						case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+					} break;
+				case '4': __HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_4,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4); break;
+						case '1': HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
+					} break;
+			} break;
 
-			case '5':
-				switch (Channel) {
-					case '1': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_1,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_1); break;
-							case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1);
-						}break;
-					case '2': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_2,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_2); break;
-							case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2);
-						} break;
-					case '3': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_3,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_3); break;
-							case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3);
-						} break;
-					case '4': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_4,PWM);
-						switch (State) {
-							case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_4); break;
-							case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_4);
-						} break;
-				} break;
+		case '5':
+			switch (Channel) {
+				case '1': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_1,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_1); break;
+						case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1);
+					}break;
+				case '2': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_2,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_2); break;
+						case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2);
+					} break;
+				case '3': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_3,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_3); break;
+						case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3);
+					} break;
+				case '4': __HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_4,PWM);
+					switch (State) {
+						case '0': HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_4); break;
+						case '1': HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_4);
+					} break;
+			} break;
 
 //			case '8':
 //				switch (Channel) {
-//				case '1': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_1,PWM);
-//				switch (State) {case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_1); case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);}
-//				case '2': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_2,PWM);
-//				switch (State) {case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_2); case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);}
-//				case '3': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_3,PWM);
-//				switch (State) {case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_3); case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);}
-//				case '4': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_4,PWM);
-//				switch (State) {case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_4); case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_4);}
+//					case '1': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_1,PWM);
+//						switch (State) {
+//							case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_1);
+//							case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);}
+//					case '2': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_2,PWM);
+//						switch (State) {
+//							case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_2);
+//							case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);}
+//					case '3': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_3,PWM);
+//						switch (State) {
+//							case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_3);
+//							case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);}
+//					case '4': __HAL_TIM_SetCompare(&htim8, TIM_CHANNEL_4,PWM);
+//						switch (State) {
+//							case '0': HAL_TIM_PWM_Stop(&htim8, TIM_CHANNEL_4);
+//							case '1': HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_4);}
 //				}
-			} break;
-		}
+		} break;
 	}
-	for (i=0;i<100;i++) {Rx_String[i]=0;}
+	for (uint8_t i=0;i<100;i++) {Rx_String[i]=0;}
 }
 
 
@@ -1184,26 +1438,32 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     uint8_t i;
     if (huart->Instance == USART3)  //current UART
 	{
-		if (Rx_index==0) {for (i=0;i<100;i++) {
+    	if (Rx_index==0) {for (i=0;i<100;i++) {
 			Rx_Buffer[i]=0;   //clear Rx_Buffer before receiving new data
 			Rx_String[i]=0;
 		}}
 
-		if (Rx_data[0]!=13) //if received data different from ascii 13 (enter)
-		{
-			Rx_Buffer[Rx_index++]=Rx_data[0];    //add data to Rx_Buffer
-		}
-		else            //if received data = 13
-		{
-			Rx_index=0;
-			Transfer_cplt=1;//transfer complete, data is ready to read
-		}
+
+	if (Rx_data[0]!=13) //if received data different from ascii 13 (enter)
+	{
+		Rx_Buffer[Rx_index++]=Rx_data[0];    //add data to Rx_Buffer
+	}
+	else            //if received data = 13
+	{
+		Rx_Buffer[Rx_index++]=Rx_data[0];    //add data to Rx_Buffer
+		Rx_Buffer[Rx_index++]="!";    //add data to Rx_Buffer
+		Rx_index=0;
+		Transfer_cplt=1;//transfer complete, data is ready to read
+	}
 
 	HAL_UART_Receive_IT(&huart3, Rx_data, 1);   //activate UART receive interrupt every time
 	strcpy (Rx_String, Rx_Buffer);
-//	Rx_Buffer[destination_size - 1] = '\0';
-//	len=sprintf(buffer, "#Protection 1 not Alive\r\n");
-//	HAL_UART_Transmit(&huart3, buffer, len, 1000);
+//	if(Transfer_cplt == 1)
+//	{
+//		len=sprintf(bufferEcho, Rx_Buffer);
+//		HAL_UART_Transmit_IT(&huart3, bufferEcho, len);
+//	}
+
 	}
 
 }
